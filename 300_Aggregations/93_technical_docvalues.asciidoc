@@ -1,56 +1,32 @@
+[[_deep_dive_on_doc_values]]
+=== 深入理解 Doc Values
 
-=== Deep Dive on Doc Values
+在上一节一开头我们就说 `Doc Values` 是 _"快速、高效并且内存友好"_ 。
+这个口号听不起来不错，不过话说回来 `Doc Values` 到底是如何工作的呢？
 
-The last section opened by saying doc values are _"fast, efficient and memory-friendly"_.
-Those are some nice marketing buzzwords, but how do doc values actually work?
+`Doc Values` 是在索引时与 `倒排索引` 同时生成。也就是说 `Doc Values` 和 `倒排索引` 一样，基于 `Segement` 生成并且是不可变的。同时 `Doc Values` 和 `倒排索引` 一样序列化到磁盘，这样对性能和扩展性有很大帮助。
 
-Doc values are generated at index-time, alongside the creation of the inverted index.
-That means doc values are generated on a per-segment basis and are immutable, just like
-the inverted index used for search. And, like the inverted index, doc values are serialized
-to disk.  This is important to performance and scalability.
-
-By serializing a persistent data structure to disk, we can rely on the OS's file
-system cache to manage memory instead of retaining structures on the JVM heap.
-In situations where the "working set" of data is smaller than the available
-memory, the OS will naturally keep the doc values resident in memory.  This gives
-the same performance profile as on-heap data structures.
-
-But when your working set is much larger than available memory, the OS will begin
-paging the doc values on/off disk as required.  This will obviously be slower
-than an entirely memory-resident data structure, but it has the advantage of scaling
-well beyond the server's memory capacity.  If these data structures were
-purely on-heap, the only option is to crash with an OutOfMemory exception (or implement
-a paging scheme just like the OS).
-
+`Doc Values` 通过序列化把数据结构持久化到磁盘，我们可以充分利用操作系统的内存，而不是 `JVM` 的 `Heap` 。
+当 `working set` 远小于系统的可用内存，系统会自动将 `Doc Values` 驻留在内存中，使得其读写十分快速；不过，当其远大于可用内存时，系统会根据需要从磁盘读取 `Doc Values`，然后选择性放到分页缓存中。很显然，这样性能会比在内存中差很多，但是它的大小就不再局限于服务器的内存了。如果是使用 `JVM` 的 `Heap` 来实现那么只能是因为 `OutOfMemory` 导致程序崩溃了。  
 [NOTE]
 ====
-Because doc values are not managed by the JVM, Elasticsearch servers can be
-configured with a much smaller heap.  This gives more memory to the OS for caching.
-It also has the benefit of letting the JVM's garbage collector work with a smaller
-heap, which will result in faster and more efficient collection cycles.
+因为 `Doc Values` 不是由 `JVM` 来管理，所以 `Elasticsearch` 实例可以配置一个很小的 `JVM Heap`，这样给系统留出来更多的内存。同时更小的  `Heap` 可以让 `JVM` 更加快速和高效的回收。
 
-Traditionally, the recommendation has been to dedicate 50% of the machine's memory
-to the JVM heap.  With the introduction of doc values, this recommendation is starting
-to slide.  Consider giving far less to the heap, perhaps 4-16gb on a 64gb machine,
-instead of the full 32gb previously recommended.
+之前，我们会建议分配机器内存的 `50%` 来给 `JVM Heap`。但是对于 `Doc Values`，这样可能不是最合适的方案了。
+以 `64gb` 内存的机器为例，可能给 `Heap` 分配 `4-16gb` 的内存更合适，而不是 `32gb`。
 
-For a more detailed discussion, see <<heap-sizing>>.
+有关更详细的讨论，查看 <<heap-sizing>>.
 ====
 
 
-==== Column-store compression
+==== 列式存储的压缩
 
-At a high level, doc values are essentially a serialized _column-store_.  As we
-discussed in the last section, column-stores excel at certain operations because
-the data is naturally laid out in a fashion that is amenable to those queries.
+从广义来说，`Doc Values` 本质上是一个序列化的 _列式存储_ 。
+正如我们上一节所讨论的，_列式存储_ 适用于聚合、排序、脚本等操作。
 
-But they also excel at compressing data, particularly numbers.  This is important for both saving space
-on disk _and_ for faster access.  Modern CPU's are many orders of magnitude faster
-than disk drives (although the gap is narrowing quickly with upcoming NVMe drives).  That means
-it is often advantageous to minimize the amount of data that must be read from disk,
-even if it requires extra CPU cycles to decompress.
+而且，这种存储方式也非常便于压缩，特别是数字类型。这样可以减少磁盘空间并且提高访问速度。现代 `CPU` 的处理速度要比磁盘快几个数量级（尽管即将到来的 NVMe 驱动器正在迅速缩小差距）。所以我们必须减少直接存磁盘读取数据的大小，尽管需要额外消耗 `CPU`  运算用来进行解压。
 
-To see how it can help compression, take this set of doc values for a numeric field:
+要了解它如何压缩数据的，来看一组数字类型的 `Doc Values`：
 
   Doc      Terms
   -----------------------------------------------------------------
@@ -63,66 +39,41 @@ To see how it can help compression, take this set of doc values for a numeric fi
   Doc_7 | 4200
   -----------------------------------------------------------------
 
-The column-stride layout means we have a contiguous block of numbers:
-`[100,1000,1500,1200,300,1900,4200]`.  Because we know they are all numbers
-(instead of a heterogeneous collection like you'd see in a document or row)
-values can be packed tightly together with uniform offsets.
+按列布局意味着我们有一个连续的数据块： `[100,1000,1500,1200,300,1900,4200]` 。因为我们已经知道他们都是数字（而不是像文档或行中看到的异构集合），所以我们可以使用统一的偏移来将他们紧紧排列。  
 
-Further, there are a variety of compression tricks we can apply to these numbers.
-You'll notice that each of the above numbers are a multiple of 100.  Doc values
-detect when all the values in a segment share a _greatest common divisor_ and use
-that to compress the values further.
+而且，针对这样的数字有很多种压缩技巧。你会注意到这里每个数字都是 100 的倍数，`Doc Values` 会检测一个段里面的所有数值，并使用一个 _最大公约数_ ，方便做进一步的数据压缩。
 
-If we save `100` as the divisor for this segment, we can divide each number by 100
-to get:  `[1,10,15,12,3,19,42]`.  Now that the numbers are smaller, they require
-fewer bits to store and we've reduced the size on-disk.
+如果我们保存 `100` 作为此段的除数，我们可以对每个数字都除以 100，然后得到：  `[1,10,15,12,3,19,42]` 。现在这些数字变小了，只需要很少的位就可以存储下，也减少了磁盘存放的大小。
 
-Doc values use several tricks like this.  In order, the following compression
-schemes are checked:
+`Doc Values` 在压缩过程中使用如下技巧。它会按依次检测以下压缩模式:
 
-1. If all values are identical (or missing), set a flag and record the value
-2. If there are fewer than 256 values, a simple table encoding is used
-3. If there are > 256 values, check to see if there is a common divisor
-4. If there is no common divisor, encode everything as an offset from the smallest
-value
+1. 如果所有的数值各不相同（或缺失），设置一个标记并记录这些值
+2. 如果这些值小于 256，将使用一个简单的编码表
+3. 如果这些值大于 256，检测是否存在一个最大公约数
+4. 如果没有存在最大公约数，从最小的数值开始，统一计算偏移量进行编码
 
-You'll note that these compression schemes are not "traditional" general purpose
-compression like DEFLATE or LZ4.  Because the structure of column-stores are
-rigid and well-defined, we can achieve higher compression by using specialized
-schemes rather than the more general compression algorithms like LZ4.
+你会发现这些压缩模式不是传统的通用的压缩方式，比如 `DEFLATE` 或是 `LZ4`。
+因为列式存储的结构是严格且良好定义的，我们可以通过使用专门的模式来达到比通用压缩算法（如 LZ4 ）更高的压缩效果。
 
 [NOTE]
 ====
-You may be thinking _"Well that's great for numbers, but what about strings?"_
-Strings are encoded similarly, with the help of an ordinal table.  The
-strings are de-duplicated and sorted into a table, assigned an ID, and then those
-ID's are used as numeric doc values.  Which means strings enjoy many of the same
-compression benefits that numerics do.
+你也许会想 _"好吧，貌似对数字很好，不知道字符串怎么样？"_
+通过借助顺序表（ordinal table），`String` 类型也是类似进行编码的。`String` 类型是去重之后存放到顺序表的，通过分配一个 `ID`，然后通过数字类型的 `ID` 构建 `Doc Values`。这样 `String` 类型和数值类型可以达到同样的压缩效果。  
 
-The ordinal table itself has some compression tricks, such as using fixed, variable
-or prefix-encoded strings.
+顺序表本身也有很多压缩技巧，比如固定长度、变长或是前缀字符编码等等。
+
 ====
 
-==== Disabling Doc Values
+==== 禁用 Doc Values
 
-Doc values are enabled by default for all fields _except_ analyzed strings.  That means
-all numerics, geo_points, dates, IPs and `not_analyzed` strings.
+`Doc Values` 默认对所有字段启用，除了 `analyzed strings`。也就是说所有的数字、地理坐标、日期、IP 和不分析（ `not_analyzed` ）字符类型都会默认开启。
 
-Analyzed strings are not able to use doc values at this time; the analysis process
-generates many tokens and does not work efficiently with doc values.  We'll discuss
-using analyzed strings for aggregations in <<aggregations-and-analysis>>.
+`analyzed strings` 暂时还不能使用 `Doc Values`。文本经过分析流程生成很多 `Token`，使得 `Doc Values` 不能高效运行。我们将在  <<aggregations-and-analysis>> 讨论如何使用分析字符类型来做聚合。
 
-Because doc values are on by default, you have the option to aggregate and sort
-on most fields in your dataset.  But what if you know you will _never_ aggregate,
-sort or script on a certain field?
+因为 `Doc Values` 默认启用，你可以选择对你数据集里面的大多数字段进行聚合和排序操作。但是如果你知道你永远也不会对某些字段进行聚合、排序或是使用脚本操作？
+尽管这并不常见，但是你可以通过禁用特定字段的 `Doc Values` 。这样不仅节省磁盘空间，也许会提升索引的速度。
 
-While rare, these circumstances do arise and you may wish to disable doc values
-on that particular field.  This will save you some disk space (since the doc values
-are not being serialized to disk anymore) and may increase indexing speed slightly
-(since the doc values don't need to be generated).
-
-To disable doc values, set `doc_values: false` in the field's mapping.  For example,
-here we create a new index where doc values are disabled for the `"session_id"` field:
+要禁用 `Doc Values` ，在字段的映射（mapping）设置 `doc_values: false` 即可。例如，这里我们创建了一个新的索引，字段 `"session_id"` 禁用了  `Doc Values`：
 
 [source,js]
 ----
@@ -141,13 +92,9 @@ PUT my_index
   }
 }
 ----
-<1> By setting `doc_values: false`, this field will not be usable in aggregations, sorts
-or scripts
+<1> 通过设置 `doc_values: false` ，这个字段将不能被用于聚合、排序以及脚本操作
 
-It is possible to configure the inverse relationship too: make a field available
-for aggregations via doc values, but make it unavailable for normal search by disabling
-the inverted index.  For example:
-
+反过来也是可以进行配置的：让一个字段可以被聚合，通过禁用倒排索引，使它不能被正常搜索，例如：
 
 [source,js]
 ----
@@ -167,9 +114,7 @@ PUT my_index
   }
 }
 ----
-<1> Doc values are enabled to allow aggregations
-<2> Indexing is disabled, which makes the field unavailable to queries/searches
+<1> `Doc Values` 被启用来允许聚合
+<2> 索引被禁用了，这让该字段不能被查询/搜索
 
-By setting `doc_values: true` and `index: no`, we generate a field which can _only_
-be used in aggregations/sorts/scripts.  This is admittedly a very rare requirement,
-but sometimes useful.
+通过设置 `doc_values: true` 和 `index: no` ，我们得到一个只能被用于聚合/排序/脚本的字段。无可否认，这是一个非常少见的情况，但有时很有用。
